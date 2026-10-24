@@ -26,6 +26,15 @@ app.post("/check", (req, res) => {
   res.json({ result: "pass" });
 });
 
+app.get("/health",async (req, res) => {
+  try {
+    await checkDb();
+    res.json({ ok: true });
+  } catch {
+    res.status(503).json({ ok: false })
+  }
+});
+
 // Start the server when this file is run directly: `npm run dev` / `npm start`
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   await checkDb();

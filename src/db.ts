@@ -8,6 +8,7 @@ if (!connectionString) {
 
 // One shared pool for the whole app; it opens connections on demand and reuses them.
 export const pool = new pg.Pool({ connectionString });
+pool.on("error", (err) => console.error("Idle database connection lost:", err.message));
 
 export async function checkDb(): Promise<void> {
   const { rows } = await pool.query<{ ok: number }>("SELECT 1 AS ok");

@@ -1,6 +1,6 @@
 import express, { type ErrorRequestHandler } from "express";
 import { checkText, ModelError } from "./checker.js";
-import { checkDb } from "./db.js";
+import { checkDb, pool } from "./db.js";
 
 export const app = express();
 app.use(express.json({ limit: "1mb" }));
@@ -22,8 +22,15 @@ app.post("/check", async (req, res) => {
     res.status(400).json({ error: "Body must be { text: string, rules: string[] }" });
     return;
   }
-  // Express 5 forwards a rejected promise to the error handler below.
-  const { result, reasons } = await checkText(req.body.text, req.body.rules);
+  // Express 5 forwards a rejected promise to the error handler below,
+  // so a failed model call or a failed insert never reaches res.json.
+  const { text, rules } = req.body;
+  const { result, reasons, model } = await checkText(text, rules);
+  // JSON.stringify because pg would otherwise send JS arrays as Postgres arrays, not JSONB.
+  await pool.query(
+    "INSERT INTO checks (text, rules, result, reasons, model) VALUES ($1, $2, $3, $4, $5)",
+    [text, JSON.stringify(rules), result, JSON.stringify(reasons), model],
+  );
   res.json({ result, reasons });
 });
 

@@ -7,6 +7,8 @@ const OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions";
 const MODEL = process.env.OPENROUTER_MODEL || "openrouter/free";
 
 export type CheckResult = { result: "pass" | "flag"; reasons: string[] };
+// model is the one OpenRouter actually routed to, or null if the response didn't say.
+export type CheckOutcome = CheckResult & { model: string | null };
 
 // Thrown when the upstream model call fails or its reply is unusable; the server maps it to 502.
 export class ModelError extends Error {
@@ -29,7 +31,7 @@ Reply with ONLY a JSON object, no other text, in exactly this shape:
 Use "flag" if the text breaks any rule, with one short reason per broken rule.
 Use "pass" with an empty reasons array if it breaks none.`;
 
-export async function checkText(text: string, rules: string[]): Promise<CheckResult> {
+export async function checkText(text: string, rules: string[]): Promise<CheckOutcome> {
   const userPrompt = `Rules:\n${rules.map((rule, i) => `${i + 1}. ${rule}`).join("\n")}\n\nText:\n${text}`;
 
   let response: Response;
@@ -81,5 +83,5 @@ export async function checkText(text: string, rules: string[]): Promise<CheckRes
   if (!isCheckResult(parsed)) {
     throw new ModelError(`Model reply did not match { result: "pass" | "flag", reasons: string[] }: ${content}`);
   }
-  return parsed;
+  return { ...parsed, model: data.model ?? null };
 }

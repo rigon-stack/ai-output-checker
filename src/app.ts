@@ -43,6 +43,11 @@ app.get("/health",async (req, res) => {
   }
 });
 
+app.use((req, res) => {
+  res.status(404).json({ error: "This route doesnt exist" });
+  return;
+})
+
 // Catch-all error handler: always answer with JSON instead of Express's HTML stack-trace page.
 // Registered after the routes so it sees errors from all of them.
 const errorHandler: ErrorRequestHandler = (err, req, res, next) => {

@@ -1,5 +1,5 @@
 import express, { type ErrorRequestHandler } from "express";
-import { checkText, ModelError } from "./checker.js";
+import { checkText, ModelError, ModelTimeoutError } from "./checker.js";
 import { checkDb, pool } from "./db.js";
 
 export const app = express();
@@ -50,9 +50,15 @@ app.use((req, res) => {
 
 // Catch-all error handler: always answer with JSON instead of Express's HTML stack-trace page.
 // Registered after the routes so it sees errors from all of them.
-const errorHandler: ErrorRequestHandler = (err, req, res, next) => {
+export const errorHandler: ErrorRequestHandler = (err, req, res, next) => {
   if (res.headersSent) {
     next(err);
+    return;
+  }
+  // Checked before ModelError because ModelTimeoutError is a subclass of it.
+  if (err instanceof ModelTimeoutError) {
+    console.error("Model call timed out:", err.message);
+    res.status(504).json({ error: "The checking model took too long to answer" });
     return;
   }
   if (err instanceof ModelError) {

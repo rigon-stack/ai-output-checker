@@ -15,6 +15,21 @@ export class ModelError extends Error {
   override name = "ModelError";
 }
 
+// Thrown when the model call is still timing out after all retries; the server maps it to 504.
+export class ModelTimeoutError extends ModelError {
+  override name = "ModelTimeoutError";
+}
+
+// Defaults for the OpenRouter call; tests override them so they run fast and never hit the real API.
+export type CheckOptions = {
+  fetch?: typeof fetch;
+  timeoutMs?: number;
+  retryDelayMs?: number;
+};
+const TIMEOUT_MS = 20_000;
+const RETRY_DELAY_MS = 1_000;
+const MAX_RETRIES = 2;
+
 function isCheckResult(value: unknown): value is CheckResult {
   if (typeof value !== "object" || value === null) return false;
   const { result, reasons } = value as Record<string, unknown>;
@@ -31,38 +46,72 @@ Reply with ONLY a JSON object, no other text, in exactly this shape:
 Use "flag" if the text breaks any rule, with one short reason per broken rule.
 Use "pass" with an empty reasons array if it breaks none.`;
 
-export async function checkText(text: string, rules: string[]): Promise<CheckOutcome> {
+export async function checkText(
+  text: string,
+  rules: string[],
+  { fetch: fetchFn = fetch, timeoutMs = TIMEOUT_MS, retryDelayMs = RETRY_DELAY_MS }: CheckOptions = {},
+): Promise<CheckOutcome> {
   const userPrompt = `Rules:\n${rules.map((rule, i) => `${i + 1}. ${rule}`).join("\n")}\n\nText:\n${text}`;
+  const body = JSON.stringify({
+    model: MODEL,
+    messages: [
+      { role: "system", content: SYSTEM_PROMPT },
+      { role: "user", content: userPrompt },
+    ],
+    temperature: 0,
+  });
 
-  let response: Response;
+  // One request with its own timeout. Returns the body text on success; otherwise says whether to retry.
+  async function attempt(): Promise<{ ok: true; bodyText: string } | { ok: false; retry: boolean; error: ModelError }> {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const response = await fetchFn(OPENROUTER_URL, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          "Content-Type": "application/json",
+        },
+        body,
+        signal: controller.signal,
+      });
+      // Reading the body is inside the timeout too, so a response that stalls mid-stream can't hang forever.
+      const bodyText = await response.text();
+      if (response.ok) return { ok: true, bodyText };
+      // 429 and 5xx are usually temporary; other 4xx (bad key, bad request) will fail the same way again.
+      const retry = response.status === 429 || response.status >= 500;
+      return { ok: false, retry, error: new ModelError(`OpenRouter request failed: ${response.status} ${bodyText}`) };
+    } catch (err) {
+      // Our own abort means the timeout fired; anything else thrown by fetch is a network error.
+      const error = controller.signal.aborted
+        ? new ModelTimeoutError(`OpenRouter request timed out after ${timeoutMs}ms`)
+        : new ModelError(`OpenRouter request failed: ${(err as Error).message}`);
+      return { ok: false, retry: true, error };
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  let bodyText: string | undefined;
+  for (let tries = 0; bodyText === undefined; tries++) {
+    const outcome = await attempt();
+    if (outcome.ok) {
+      bodyText = outcome.bodyText;
+    } else if (!outcome.retry || tries >= MAX_RETRIES) {
+      throw outcome.error;
+    } else {
+      console.warn(`${outcome.error.message}; retrying (${tries + 1}/${MAX_RETRIES})`);
+      // Wait a little longer before each retry to give a struggling upstream room to recover.
+      await new Promise((resolve) => setTimeout(resolve, retryDelayMs * (tries + 1)));
+    }
+  }
+
+  let data: { model?: string; choices?: { message?: { content?: string } }[] };
   try {
-    response = await fetch(OPENROUTER_URL, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model: MODEL,
-        messages: [
-          { role: "system", content: SYSTEM_PROMPT },
-          { role: "user", content: userPrompt },
-        ],
-        temperature: 0,
-      }),
-    });
-  } catch (err) {
-    throw new ModelError(`OpenRouter request failed: ${(err as Error).message}`);
+    data = JSON.parse(bodyText);
+  } catch {
+    throw new ModelError(`OpenRouter response was not valid JSON: ${bodyText}`);
   }
-
-  if (!response.ok) {
-    throw new ModelError(`OpenRouter request failed: ${response.status} ${await response.text()}`);
-  }
-
-  const data = (await response.json()) as {
-    model?: string;
-    choices?: { message?: { content?: string } }[];
-  };
   // openrouter/free routes to whichever free model is available, so log which one answered.
   console.log(`checkText answered by ${data.model ?? "unknown model"}`);
   const content = data.choices?.[0]?.message?.content;

@@ -36,7 +36,7 @@ curl -X POST http://localhost:3000/check \
 # {"result":"pass","reasons":[]}
 ```
 
-`result` is `"pass"` or `"flag"`, with one reason per broken rule. A body that isn't `{ text: string, rules: string[] }` gets a `400`, a failed or unusable model reply gets a `502`, and a failed database insert gets a `500`.
+`result` is `"pass"` or `"flag"`, with one reason per broken rule. A body that isn't `{ text: string, rules: string[] }` gets a `400`, a failed or unusable model reply gets a `502` (or a `504` if it timed out after retries), and a failed database insert gets a `500`.
 
 `GET /health` returns `{ "ok": true }` if the database answers, otherwise `503` with `{ "ok": false }`.
 

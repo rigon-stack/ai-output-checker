@@ -1,5 +1,5 @@
 import express, { type ErrorRequestHandler } from "express";
-import { checkText, ModelError, ModelTimeoutError } from "./checker.js";
+import { checkText, ModelError, ModelTimeoutError, UnusableReplyError } from "./checker.js";
 import { checkDb, pool } from "./db.js";
 
 export const app = express();
@@ -17,6 +17,19 @@ function isCheckRequest(body: unknown): body is CheckRequest {
   );
 }
 
+// Saves an unusable model reply for later inspection. Never throws: a failed insert is only logged,
+// so the caller can still rethrow the original model error and answer 502.
+async function quarantine(text: string, rules: string[], err: UnusableReplyError): Promise<void> {
+  try {
+    await pool.query(
+      "INSERT INTO quarantine (text, rules, raw_reply, reason) VALUES ($1, $2, $3, $4)",
+      [text, JSON.stringify(rules), err.rawReply, err.reason],
+    );
+  } catch (insertErr) {
+    console.error("Failed to save unusable reply to quarantine:", insertErr);
+  }
+}
+
 app.post("/check", async (req, res) => {
   if (!isCheckRequest(req.body)) {
     res.status(400).json({ error: "Body must be { text: string, rules: string[] }" });
@@ -25,7 +38,15 @@ app.post("/check", async (req, res) => {
   // Express 5 forwards a rejected promise to the error handler below,
   // so a failed model call or a failed insert never reaches res.json.
   const { text, rules } = req.body;
-  const { result, reasons, model } = await checkText(text, rules);
+  let outcome;
+  try {
+    outcome = await checkText(text, rules);
+  } catch (err) {
+    // Only replies the model actually sent go to quarantine; timeouts and network errors have nothing to keep.
+    if (err instanceof UnusableReplyError) await quarantine(text, rules, err);
+    throw err;
+  }
+  const { result, reasons, model } = outcome;
   // JSON.stringify because pg would otherwise send JS arrays as Postgres arrays, not JSONB.
   await pool.query(
     "INSERT INTO checks (text, rules, result, reasons, model) VALUES ($1, $2, $3, $4, $5)",

@@ -1,0 +1,108 @@
+import { after, afterEach, before, mock, test } from "node:test";
+import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
+import type { Server } from "node:http";
+import type { AddressInfo } from "node:net";
+import { app } from "../src/app.js";
+import { pool } from "../src/db.js";
+
+let server: Server;
+let baseUrl: string;
+// Every row these tests create starts with this, so after() can remove exactly those rows.
+const MARKER = "quarantine-test-";
+
+before(async () => {
+  server = await new Promise<Server>((resolve) => {
+    const s = app.listen(0, () => resolve(s));
+  });
+  const { port } = server.address() as AddressInfo;
+  baseUrl = `http://127.0.0.1:${port}`;
+});
+
+afterEach(() => mock.restoreAll());
+
+after(async () => {
+  await pool.query("DELETE FROM quarantine WHERE text LIKE $1", [`${MARKER}%`]);
+  await new Promise<void>((resolve, reject) => server.close((err) => (err ? reject(err) : resolve())));
+  await pool.end();
+});
+
+// Replaces fetch for OpenRouter only; the test's own requests to the app still use the real fetch.
+const realFetch = globalThis.fetch;
+function fakeOpenRouter(answer: () => Response) {
+  mock.method(globalThis, "fetch", async (input: string | URL | Request, init?: RequestInit) => {
+    if (String(input).startsWith("https://openrouter.ai/")) return answer();
+    return realFetch(input, init);
+  });
+}
+
+// A successful OpenRouter response whose message content is the given model reply.
+function modelReplies(content: string) {
+  return () => new Response(JSON.stringify({ model: "fake/model", choices: [{ message: { content } }] }));
+}
+
+async function postCheck(text: string) {
+  return realFetch(`${baseUrl}/check`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text, rules: ["be nice"] }),
+  });
+}
+
+async function quarantined(text: string) {
+  const { rows } = await pool.query("SELECT rules, raw_reply, reason FROM quarantine WHERE text = $1", [text]);
+  return rows;
+}
+
+test("a reply that isn't JSON is quarantined and the request gets 502", async () => {
+  fakeOpenRouter(modelReplies("Sure! The text looks fine."));
+  const text = MARKER + randomUUID();
+
+  const res = await postCheck(text);
+  assert.equal(res.status, 502);
+  assert.deepEqual(await quarantined(text), [
+    { rules: ["be nice"], raw_reply: "Sure! The text looks fine.", reason: "Model reply was not valid JSON" },
+  ]);
+});
+
+test("JSON in the wrong shape is quarantined and the request gets 502", async () => {
+  fakeOpenRouter(modelReplies('{"verdict": "ok"}'));
+  const text = MARKER + randomUUID();
+
+  const res = await postCheck(text);
+  assert.equal(res.status, 502);
+  const rows = await quarantined(text);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].raw_reply, '{"verdict": "ok"}');
+  assert.match(rows[0].reason, /did not match/);
+});
+
+test("a failed quarantine insert is logged and the request still gets 502", async () => {
+  fakeOpenRouter(modelReplies("not json"));
+  const realQuery = pool.query.bind(pool);
+  mock.method(pool, "query", async (sql: string, params?: unknown[]) => {
+    if (sql.startsWith("INSERT INTO quarantine")) throw new Error("disk full");
+    return realQuery(sql, params);
+  });
+  const consoleError = mock.method(console, "error", () => {});
+
+  const res = await postCheck(MARKER + randomUUID());
+  assert.equal(res.status, 502);
+  const messages = consoleError.mock.calls.map((call) => String(call.arguments[0]));
+  assert.ok(messages.includes("Failed to save unusable reply to quarantine:"));
+  // The original model error still reaches the error handler.
+  assert.ok(messages.includes("Model call failed:"));
+});
+
+// A network error is retried with the real 1s + 2s waits, so this test takes about 3 seconds.
+test("a network error is not quarantined", async () => {
+  fakeOpenRouter(() => {
+    throw new TypeError("fetch failed");
+  });
+  mock.method(console, "warn", () => {});
+  const text = MARKER + randomUUID();
+
+  const res = await postCheck(text);
+  assert.equal(res.status, 502);
+  assert.deepEqual(await quarantined(text), []);
+});

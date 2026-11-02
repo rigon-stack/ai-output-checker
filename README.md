@@ -16,7 +16,7 @@ npm install
 cp .env.example .env      # then edit the values: the password and OPENROUTER_API_KEY
 docker compose up -d      # starts Postgres 16 in the background
 npm run db:check          # should print "Database connection OK"
-npm run migrate           # creates the checks table
+npm run migrate           # creates the checks and quarantine tables
 ```
 
 If you change the password in `.env`, update it in both `POSTGRES_PASSWORD` and `DATABASE_URL`.
@@ -60,7 +60,7 @@ src/
   checker.ts    checkText: calls OpenRouter and validates the reply
   db.ts         Postgres connection pool and health check
   migrate.ts    Runs the migrations
-migrations/     SQL migrations (001_create_checks.sql)
+migrations/     SQL migrations (001_create_checks.sql, 002_create_quarantine.sql)
 tests/          Smoke tests (node:test), no model calls
 docker-compose.yml   Local Postgres 16
 .env.example         Template for required environment variables

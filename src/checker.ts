@@ -20,6 +20,17 @@ export class ModelTimeoutError extends ModelError {
   override name = "ModelTimeoutError";
 }
 
+// Thrown when the model answered but its reply can't be used; carries the reply so it can be quarantined.
+export class UnusableReplyError extends ModelError {
+  override name = "UnusableReplyError";
+  constructor(
+    readonly reason: string,
+    readonly rawReply: string,
+  ) {
+    super(`${reason}: ${rawReply}`);
+  }
+}
+
 // Defaults for the OpenRouter call; tests override them so they run fast and never hit the real API.
 export type CheckOptions = {
   fetch?: typeof fetch;
@@ -126,11 +137,11 @@ export async function checkText(
   try {
     parsed = JSON.parse(jsonText);
   } catch {
-    throw new ModelError(`Model reply was not valid JSON: ${content}`);
+    throw new UnusableReplyError("Model reply was not valid JSON", content);
   }
 
   if (!isCheckResult(parsed)) {
-    throw new ModelError(`Model reply did not match { result: "pass" | "flag", reasons: string[] }: ${content}`);
+    throw new UnusableReplyError('Model reply did not match { result: "pass" | "flag", reasons: string[] }', content);
   }
   return { ...parsed, model: data.model ?? null };
 }

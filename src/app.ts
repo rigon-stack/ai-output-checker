@@ -30,6 +30,12 @@ async function quarantine(text: string, rules: string[], err: UnusableReplyError
   }
 }
 
+// Read on every request so the limit can be changed without a restart (and in tests).
+function dailyCheckLimit(): number {
+  const limit = Number(process.env.DAILY_CHECK_LIMIT);
+  return process.env.DAILY_CHECK_LIMIT?.trim() && Number.isFinite(limit) && limit >= 0 ? limit : 50;
+}
+
 app.post("/check", async (req, res) => {
   if (!isCheckRequest(req.body)) {
     res.status(400).json({ error: "Body must be { text: string, rules: string[] }" });
@@ -38,6 +44,22 @@ app.post("/check", async (req, res) => {
   // Express 5 forwards a rejected promise to the error handler below,
   // so a failed model call or a failed insert never reaches res.json.
   const { text, rules } = req.body;
+
+  // Daily limit: checked before the model is called. A failing count query rejects and becomes a 500.
+  const limit = dailyCheckLimit();
+  const { rows } = await pool.query<{ count: number }>(
+    "SELECT count(*)::int AS count FROM checks WHERE created_at >= date_trunc('day', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'",
+  );
+  if (rows[0]!.count >= limit) {
+    const now = new Date();
+    const resetsAt = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1));
+    res
+      .status(429)
+      .set("Retry-After", String(Math.ceil((resetsAt.getTime() - now.getTime()) / 1000)))
+      .json({ error: "daily_limit_reached", limit, resetsAt: resetsAt.toISOString() });
+    return;
+  }
+
   let outcome;
   try {
     outcome = await checkText(text, rules);

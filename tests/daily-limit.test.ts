@@ -1,0 +1,98 @@
+import { after, afterEach, before, mock, test } from "node:test";
+import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
+import type { Server } from "node:http";
+import type { AddressInfo } from "node:net";
+import { app } from "../src/app.js";
+import { pool } from "../src/db.js";
+
+let server: Server;
+let baseUrl: string;
+const realFetch = globalThis.fetch;
+const originalLimit = process.env.DAILY_CHECK_LIMIT;
+
+before(async () => {
+  server = await new Promise<Server>((resolve) => {
+    const s = app.listen(0, () => resolve(s));
+  });
+  baseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+});
+
+afterEach(() => {
+  mock.restoreAll();
+  if (originalLimit === undefined) delete process.env.DAILY_CHECK_LIMIT;
+  else process.env.DAILY_CHECK_LIMIT = originalLimit;
+});
+
+after(async () => {
+  await new Promise<void>((resolve, reject) => server.close((err) => (err ? reject(err) : resolve())));
+  await pool.end();
+});
+
+function post(text: string) {
+  return realFetch(`${baseUrl}/check`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text, rules: ["be nice"] }),
+  });
+}
+
+test("over the daily limit: 429 with body and Retry-After, no model call, no row", async () => {
+  process.env.DAILY_CHECK_LIMIT = "2";
+  // Pretend 2 checks were already made today; record every other query so we can prove no row is inserted.
+  const otherQueries: string[] = [];
+  mock.method(pool, "query", async (sql: string) => {
+    if (sql.includes("count(*)")) return { rows: [{ count: 2 }] };
+    otherQueries.push(sql);
+    throw new Error("no other query expected");
+  });
+  let modelCalls = 0;
+  mock.method(globalThis, "fetch", async (input: string | URL | Request, init?: RequestInit) => {
+    if (String(input).startsWith("https://openrouter.ai/")) {
+      modelCalls++;
+      throw new Error("model must not be called");
+    }
+    return realFetch(input, init);
+  });
+  const text = `daily-limit-test-${randomUUID()}`;
+
+  const before = Date.now();
+  const res = await post(text);
+  assert.equal(res.status, 429);
+
+  const body = (await res.json()) as { error: string; limit: number; resetsAt: string };
+  assert.equal(body.error, "daily_limit_reached");
+  assert.equal(body.limit, 2);
+  const resetsAt = new Date(body.resetsAt);
+  assert.equal(resetsAt.toISOString(), body.resetsAt);
+  assert.equal(resetsAt.getUTCHours() + resetsAt.getUTCMinutes() + resetsAt.getUTCSeconds(), 0);
+  assert.ok(resetsAt.getTime() > before && resetsAt.getTime() - before <= 24 * 3600 * 1000);
+
+  const retryAfter = Number(res.headers.get("retry-after"));
+  assert.ok(Number.isInteger(retryAfter) && retryAfter > 0 && retryAfter <= 86400);
+  assert.ok(Math.abs(retryAfter - (resetsAt.getTime() - before) / 1000) <= 2);
+
+  assert.equal(modelCalls, 0);
+  assert.deepEqual(otherQueries, []);
+});
+
+test("a failed count query gives 500 and does not call the model", async () => {
+  let modelCalls = 0;
+  const realQuery = pool.query.bind(pool);
+  mock.method(pool, "query", async (sql: string, params?: unknown[]) => {
+    if (sql.includes("count(*)")) throw new Error("db down");
+    return realQuery(sql, params);
+  });
+  mock.method(console, "error", () => {});
+  mock.method(globalThis, "fetch", async (input: string | URL | Request, init?: RequestInit) => {
+    if (String(input).startsWith("https://openrouter.ai/")) {
+      modelCalls++;
+      throw new Error("model must not be called");
+    }
+    return realFetch(input, init);
+  });
+
+  const res = await post(`daily-limit-test-${randomUUID()}`);
+  assert.equal(res.status, 500);
+  assert.equal(modelCalls, 0);
+});

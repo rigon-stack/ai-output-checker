@@ -96,3 +96,35 @@ test("a failed count query gives 500 and does not call the model", async () => {
   assert.equal(res.status, 500);
   assert.equal(modelCalls, 0);
 });
+
+test("a failed model call (502) uses up one check from the daily limit", async () => {
+  // Real database: allow exactly one more check today, whatever is already there.
+  const { rows } = await pool.query<{ count: number }>(
+    "SELECT count(*)::int AS count FROM checks WHERE created_at >= date_trunc('day', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'",
+  );
+  process.env.DAILY_CHECK_LIMIT = String(rows[0]!.count + 1);
+  let modelCalls = 0;
+  // A 400 is not retried, so the model call fails straight away.
+  mock.method(globalThis, "fetch", async (input: string | URL | Request, init?: RequestInit) => {
+    if (String(input).startsWith("https://openrouter.ai/")) {
+      modelCalls++;
+      return new Response("bad request", { status: 400 });
+    }
+    return realFetch(input, init);
+  });
+  mock.method(console, "error", () => {});
+  const text = `daily-limit-test-${randomUUID()}`;
+
+  try {
+    const first = await post(text);
+    assert.equal(first.status, 502);
+    assert.equal(modelCalls, 1);
+
+    // The failed call used the last check, so the next one is refused without calling the model.
+    const second = await post(`${text}-again`);
+    assert.equal(second.status, 429);
+    assert.equal(modelCalls, 1);
+  } finally {
+    await pool.query("DELETE FROM checks WHERE text LIKE $1", [`${text}%`]);
+  }
+});

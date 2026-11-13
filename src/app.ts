@@ -30,6 +30,16 @@ async function quarantine(text: string, rules: string[], err: UnusableReplyError
   }
 }
 
+// Saves a failed model call so it counts toward the daily limit. Never throws: a failed insert is only logged,
+// so the caller can still rethrow the original model error and answer 502/504.
+async function recordFailedCheck(text: string, rules: string[]): Promise<void> {
+  try {
+    await pool.query("INSERT INTO checks (text, rules, status) VALUES ($1, $2, 'failed')", [text, JSON.stringify(rules)]);
+  } catch (insertErr) {
+    console.error("Failed to record failed check:", insertErr);
+  }
+}
+
 // Read on every request so the limit can be changed without a restart (and in tests).
 function dailyCheckLimit(): number {
   const limit = Number(process.env.DAILY_CHECK_LIMIT);
@@ -66,6 +76,8 @@ app.post("/check", async (req, res) => {
   } catch (err) {
     // Only replies the model actually sent go to quarantine; timeouts and network errors have nothing to keep.
     if (err instanceof UnusableReplyError) await quarantine(text, rules, err);
+    // A failed model call still uses up one check from the daily limit, so it gets a row too.
+    if (err instanceof ModelError) await recordFailedCheck(text, rules);
     throw err;
   }
   const { result, reasons, model } = outcome;

@@ -11,7 +11,12 @@ let baseUrl: string;
 // Every row these tests create starts with this, so after() can remove exactly those rows.
 const MARKER = "quarantine-test-";
 
+// These tests make several failing calls, and a failed call now counts toward the daily limit,
+// so lift the limit for this file (restored in after()).
+const originalLimit = process.env.DAILY_CHECK_LIMIT;
+
 before(async () => {
+  process.env.DAILY_CHECK_LIMIT = "1000000";
   server = await new Promise<Server>((resolve) => {
     const s = app.listen(0, () => resolve(s));
   });
@@ -22,6 +27,10 @@ before(async () => {
 afterEach(() => mock.restoreAll());
 
 after(async () => {
+  if (originalLimit === undefined) delete process.env.DAILY_CHECK_LIMIT;
+  else process.env.DAILY_CHECK_LIMIT = originalLimit;
+  // Failed calls are saved in checks too, so remove those rows as well.
+  await pool.query("DELETE FROM checks WHERE text LIKE $1", [`${MARKER}%`]);
   await pool.query("DELETE FROM quarantine WHERE text LIKE $1", [`${MARKER}%`]);
   await new Promise<void>((resolve, reject) => server.close((err) => (err ? reject(err) : resolve())));
   await pool.end();

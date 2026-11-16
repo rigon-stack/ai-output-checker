@@ -10,14 +10,14 @@ export type CheckResult = { result: "pass" | "flag"; reasons: string[] };
 // model is the one OpenRouter actually routed to, or null if the response didn't say.
 export type CheckOutcome = CheckResult & { model: string | null };
 
-// Thrown when the upstream model call fails or its reply is unusable; the server maps it to 502.
+// Thrown when the upstream model call fails and isn't worth retrying (e.g. a bad API key); the server maps it to 502.
 export class ModelError extends Error {
   override name = "ModelError";
 }
 
-// Thrown when the model call is still timing out after all retries; the server maps it to 504.
-export class ModelTimeoutError extends ModelError {
-  override name = "ModelTimeoutError";
+// Thrown when the first try and its one retry both failed; the server maps it to 503.
+export class ModelUnavailableError extends ModelError {
+  override name = "ModelUnavailableError";
 }
 
 // Thrown when the model answered but its reply can't be used; carries the reply so it can be quarantined.
@@ -36,10 +36,14 @@ export type CheckOptions = {
   fetch?: typeof fetch;
   timeoutMs?: number;
   retryDelayMs?: number;
+  // Called after every failed request to OpenRouter, before any retry. Must not throw.
+  onFailedAttempt?: (err: ModelError) => Promise<void>;
+  // Called just before a retry is sent; throwing cancels the retry and checkText rejects with that error.
+  beforeRetry?: () => Promise<void>;
 };
 const TIMEOUT_MS = 20_000;
 const RETRY_DELAY_MS = 1_000;
-const MAX_RETRIES = 2;
+const MAX_RETRIES = 1;
 
 function isCheckResult(value: unknown): value is CheckResult {
   if (typeof value !== "object" || value === null) return false;
@@ -60,7 +64,13 @@ Use "pass" with an empty reasons array if it breaks none.`;
 export async function checkText(
   text: string,
   rules: string[],
-  { fetch: fetchFn = fetch, timeoutMs = TIMEOUT_MS, retryDelayMs = RETRY_DELAY_MS }: CheckOptions = {},
+  {
+    fetch: fetchFn = fetch,
+    timeoutMs = TIMEOUT_MS,
+    retryDelayMs = RETRY_DELAY_MS,
+    onFailedAttempt = async () => {},
+    beforeRetry = async () => {},
+  }: CheckOptions = {},
 ): Promise<CheckOutcome> {
   const userPrompt = `Rules:\n${rules.map((rule, i) => `${i + 1}. ${rule}`).join("\n")}\n\nText:\n${text}`;
   const body = JSON.stringify({
@@ -72,8 +82,8 @@ export async function checkText(
     temperature: 0,
   });
 
-  // One request with its own timeout. Returns the body text on success; otherwise says whether to retry.
-  async function attempt(): Promise<{ ok: true; bodyText: string } | { ok: false; retry: boolean; error: ModelError }> {
+  // One request with its own timeout. Returns the parsed result on success; otherwise says whether to retry.
+  async function attempt(): Promise<{ ok: true; outcome: CheckOutcome } | { ok: false; retry: boolean; error: ModelError }> {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
@@ -88,14 +98,21 @@ export async function checkText(
       });
       // Reading the body is inside the timeout too, so a response that stalls mid-stream can't hang forever.
       const bodyText = await response.text();
-      if (response.ok) return { ok: true, bodyText };
+      if (response.ok) {
+        try {
+          return { ok: true, outcome: parseReply(bodyText) };
+        } catch (err) {
+          // The model answered but the reply was unusable; another try may well get a good one.
+          return { ok: false, retry: true, error: err as ModelError };
+        }
+      }
       // 429 and 5xx are usually temporary; other 4xx (bad key, bad request) will fail the same way again.
       const retry = response.status === 429 || response.status >= 500;
       return { ok: false, retry, error: new ModelError(`OpenRouter request failed: ${response.status} ${bodyText}`) };
     } catch (err) {
       // Our own abort means the timeout fired; anything else thrown by fetch is a network error.
       const error = controller.signal.aborted
-        ? new ModelTimeoutError(`OpenRouter request timed out after ${timeoutMs}ms`)
+        ? new ModelError(`OpenRouter request timed out after ${timeoutMs}ms`)
         : new ModelError(`OpenRouter request failed: ${(err as Error).message}`);
       return { ok: false, retry: true, error };
     } finally {
@@ -103,20 +120,24 @@ export async function checkText(
     }
   }
 
-  let bodyText: string | undefined;
-  for (let tries = 0; bodyText === undefined; tries++) {
-    const outcome = await attempt();
-    if (outcome.ok) {
-      bodyText = outcome.bodyText;
-    } else if (!outcome.retry || tries >= MAX_RETRIES) {
-      throw outcome.error;
-    } else {
-      console.warn(`${outcome.error.message}; retrying (${tries + 1}/${MAX_RETRIES})`);
-      // Wait a little longer before each retry to give a struggling upstream room to recover.
-      await new Promise((resolve) => setTimeout(resolve, retryDelayMs * (tries + 1)));
+  for (let tries = 0; ; tries++) {
+    const result = await attempt();
+    if (result.ok) return result.outcome;
+    await onFailedAttempt(result.error);
+    if (!result.retry) throw result.error;
+    if (tries >= MAX_RETRIES) {
+      throw new ModelUnavailableError(`Model still failing after ${MAX_RETRIES} retry: ${result.error.message}`, {
+        cause: result.error,
+      });
     }
+    await beforeRetry();
+    console.warn(`${result.error.message}; retrying (${tries + 1}/${MAX_RETRIES})`);
+    await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
   }
+}
 
+// Turns a successful OpenRouter response body into a result, or throws if it can't be used.
+function parseReply(bodyText: string): CheckOutcome {
   let data: { model?: string; choices?: { message?: { content?: string } }[] };
   try {
     data = JSON.parse(bodyText);

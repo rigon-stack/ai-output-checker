@@ -63,55 +63,65 @@ async function quarantined(text: string) {
   return rows;
 }
 
-test("a reply that isn't JSON is quarantined and the request gets 502", async () => {
-  fakeOpenRouter(modelReplies("Sure! The text looks fine."));
+// Each failing test below waits for the real 1 s retry delay.
+test("an unusable reply is retried once; a good retry gives 200 and the bad reply is quarantined", async () => {
+  const replies = [modelReplies("Sure! The text looks fine."), modelReplies('{"result": "pass", "reasons": []}')];
+  let calls = 0;
+  fakeOpenRouter(() => replies[calls++]!());
+  mock.method(console, "warn", () => {});
   const text = MARKER + randomUUID();
 
   const res = await postCheck(text);
-  assert.equal(res.status, 502);
+  assert.equal(res.status, 200);
+  assert.equal(calls, 2);
   assert.deepEqual(await quarantined(text), [
     { rules: ["be nice"], raw_reply: "Sure! The text looks fine.", reason: "Model reply was not valid JSON" },
   ]);
 });
 
-test("JSON in the wrong shape is quarantined and the request gets 502", async () => {
+test("JSON in the wrong shape twice: both replies are quarantined and the request gets 503", async () => {
   fakeOpenRouter(modelReplies('{"verdict": "ok"}'));
+  mock.method(console, "warn", () => {});
+  mock.method(console, "error", () => {});
   const text = MARKER + randomUUID();
 
   const res = await postCheck(text);
-  assert.equal(res.status, 502);
+  assert.equal(res.status, 503);
   const rows = await quarantined(text);
-  assert.equal(rows.length, 1);
-  assert.equal(rows[0].raw_reply, '{"verdict": "ok"}');
-  assert.match(rows[0].reason, /did not match/);
+  assert.equal(rows.length, 2);
+  for (const row of rows) {
+    assert.equal(row.raw_reply, '{"verdict": "ok"}');
+    assert.match(row.reason, /did not match/);
+  }
 });
 
-test("a failed quarantine insert is logged and the request still gets 502", async () => {
+test("a failed quarantine insert is logged and the request still gets 503", async () => {
   fakeOpenRouter(modelReplies("not json"));
   const realQuery = pool.query.bind(pool);
   mock.method(pool, "query", async (sql: string, params?: unknown[]) => {
     if (sql.startsWith("INSERT INTO quarantine")) throw new Error("disk full");
     return realQuery(sql, params);
   });
+  mock.method(console, "warn", () => {});
   const consoleError = mock.method(console, "error", () => {});
 
   const res = await postCheck(MARKER + randomUUID());
-  assert.equal(res.status, 502);
+  assert.equal(res.status, 503);
   const messages = consoleError.mock.calls.map((call) => String(call.arguments[0]));
   assert.ok(messages.includes("Failed to save unusable reply to quarantine:"));
   // The original model error still reaches the error handler.
-  assert.ok(messages.includes("Model call failed:"));
+  assert.ok(messages.includes("Model unavailable:"));
 });
 
-// A network error is retried with the real 1s + 2s waits, so this test takes about 3 seconds.
 test("a network error is not quarantined", async () => {
   fakeOpenRouter(() => {
     throw new TypeError("fetch failed");
   });
   mock.method(console, "warn", () => {});
+  mock.method(console, "error", () => {});
   const text = MARKER + randomUUID();
 
   const res = await postCheck(text);
-  assert.equal(res.status, 502);
+  assert.equal(res.status, 503);
   assert.deepEqual(await quarantined(text), []);
 });

@@ -36,7 +36,7 @@ curl -X POST http://localhost:3000/check \
 # {"result":"pass","reasons":[]}
 ```
 
-`result` is `"pass"` or `"flag"`, with one reason per broken rule. A body that isn't `{ text: string, rules: string[] }` gets a `400`, a failed or unusable model reply gets a `502` (or a `504` if it timed out after retries), and a failed database insert gets a `500`.
+`result` is `"pass"` or `"flag"`, with one reason per broken rule. A body that isn't `{ text: string, rules: string[] }` gets a `400`, a model call that fails on a temporary error (network, timeout, 429, 5xx, unusable reply) is retried once and gets a `503` `{ "error": "model_unavailable", "message": ... }` if the retry fails too, an OpenRouter config error (400/401/403) gets a `502` without a retry, and a failed database insert gets a `500`.
 
 `GET /health` returns `{ "ok": true }` if the database answers, otherwise `503` with `{ "ok": false }`.
 

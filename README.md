@@ -1,74 +1,68 @@
 # ai-output-checker
 
-A small HTTP service that checks a piece of AI-generated text against a list of rules.
+A small HTTP service that checks AI-generated text against your own rules before you use it.
+You send the text and a list of rules; a model (via OpenRouter) says whether the text passes or should be flagged, and why. Every check is saved to Postgres.
 
-`POST /check` sends the text and rules to a model on OpenRouter (`openrouter/free` by default, set `OPENROUTER_MODEL` to change it) and returns `{ result, reasons }`. Every check is saved to the `checks` table in Postgres. There is no auth and no payments yet.
+## Endpoints
 
-## Requirements
+### `POST /check`
 
-- Node.js 20.6 or newer (needed for `--env-file`)
-- Docker (for Postgres)
+```json
+{ "text": "string", "rules": ["string", "..."] }
+```
 
-## Setup
+Returns:
 
-```sh
+```json
+{ "result": "pass" | "flag", "reasons": ["..."] }
+```
+
+| Status | When |
+|---|---|
+| 400 | The body is invalid |
+| 429 | The daily limit is reached (`Retry-After` header included) |
+| 502 | OpenRouter config error (400/401/403), not retried |
+| 503 | `model_unavailable`: a temporary model error happened twice |
+| 500 | Database error |
+
+### `GET /health`
+
+`{ "ok": true }`, or `503` with `{ "ok": false }` if the database doesn't answer.
+
+Any other route returns a JSON 404.
+
+## How it behaves
+
+- **Retries once** on network errors, the 20 s timeout, OpenRouter 429/5xx and unusable model replies. Never on 400/401/403.
+- **Daily limit** (`DAILY_CHECK_LIMIT`, default 50). Failed model calls count toward it too, and it's re-checked before a retry.
+- **Every check is stored.** If saving fails, the request fails with 500, so there's never a check without a record.
+- **Unusable model replies** are saved to a separate quarantine table for inspection.
+- Uses `openrouter/free` by default. There's no auth yet.
+
+## Run it locally
+
+Needs Node ≥ 20.6 and Docker.
+
+```bash
 npm install
-cp .env.example .env      # then edit the values: the password and OPENROUTER_API_KEY
-docker compose up -d      # starts Postgres 16 in the background
-npm run db:check          # should print "Database connection OK"
-npm run migrate           # creates the checks and quarantine tables
+cp .env.example .env      # set the password and OPENROUTER_API_KEY
+docker compose up -d      # Postgres 16
+npm run db:check
+npm run migrate           # migrations 001–003
+npm run dev               # http://localhost:3000
 ```
 
-If you change the password in `.env`, update it in both `POSTGRES_PASSWORD` and `DATABASE_URL`.
+## Tests
 
-## Run
-
-```sh
-npm run dev               # starts the server and restarts it on file changes
+```bash
+npm test          # node:test, needs the Postgres container running
+npm run typecheck
 ```
 
-The server listens on `http://localhost:3000` (set `PORT` in `.env` to change it).
+## Environment variables
 
-```sh
-curl -X POST http://localhost:3000/check \
-  -H 'content-type: application/json' \
-  -d '{"text": "Hello world", "rules": ["no profanity"]}'
-# {"result":"pass","reasons":[]}
-```
+`POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB`, `POSTGRES_PORT`, `DATABASE_URL`, `PORT`, `OPENROUTER_API_KEY`, `OPENROUTER_MODEL`, `DAILY_CHECK_LIMIT`
 
-`result` is `"pass"` or `"flag"`, with one reason per broken rule. A body that isn't `{ text: string, rules: string[] }` gets a `400`, a model call that fails on a temporary error (network, timeout, 429, 5xx, unusable reply) is retried once and gets a `503` `{ "error": "model_unavailable", "message": ... }` if the retry fails too, an OpenRouter config error (400/401/403) gets a `502` without a retry, and a failed database insert gets a `500`.
+## Stack
 
-`GET /health` returns `{ "ok": true }` if the database answers, otherwise `503` with `{ "ok": false }`.
-
-## Scripts
-
-| Command             | What it does                                 |
-| ------------------- | -------------------------------------------- |
-| `npm run dev`       | Run the server, restarting on file changes   |
-| `npm start`         | Run the server once                          |
-| `npm run db:check`  | Connect to Postgres and run `SELECT 1`       |
-| `npm run migrate`   | Run the SQL files in `migrations/` in order  |
-| `npm test`          | Run the smoke tests (needs Docker up)        |
-| `npm run typecheck` | Type-check the code without running it       |
-
-## Project layout
-
-```
-src/
-  app.ts        Express app: POST /check, GET /health, JSON error handler
-  server.ts     Starts the app on PORT
-  checker.ts    checkText: calls OpenRouter and validates the reply
-  db.ts         Postgres connection pool and health check
-  migrate.ts    Runs the migrations
-migrations/     SQL migrations (001_create_checks.sql, 002_create_quarantine.sql)
-tests/          Smoke tests (node:test), no model calls
-docker-compose.yml   Local Postgres 16
-.env.example         Template for required environment variables
-```
-
-## Stopping Postgres
-
-```sh
-docker compose stop       # stop, keep data
-docker compose down -v    # stop and delete all data
-```
+TypeScript, Express, PostgreSQL, OpenRouter, node:test, Docker

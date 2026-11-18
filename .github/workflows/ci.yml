@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    name: test
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        # Throwaway database that only lives for this run; same names as .env.example.
+        env:
+          POSTGRES_USER: checker
+          POSTGRES_PASSWORD: change-me
+          POSTGRES_DB: ai_output_checker
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U checker -d ai_output_checker"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+    env:
+      DATABASE_URL: postgres://checker:change-me@localhost:5432/ai_output_checker
+      PORT: 3000
+      DAILY_CHECK_LIMIT: 50
+      OPENROUTER_MODEL: openrouter/free
+      # Not a real key: src/checker.ts refuses to load without some value, but every test fakes the
+      # OpenRouter call, so this is never sent anywhere.
+      OPENROUTER_API_KEY: ci-placeholder-not-a-real-key
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+
+      - run: npm run typecheck
+
+      # The npm scripts pass --env-file=.env, which fails if the file is missing.
+      # An empty one is enough: the values come from the job env above.
+      - name: Create empty .env
+        run: touch .env
+
+      - run: npm run migrate
+
+      - run: npm test

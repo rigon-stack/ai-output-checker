@@ -1,5 +1,7 @@
 # ai-output-checker
 
+[![CI](https://github.com/rigon-stack/ai-output-checker/actions/workflows/ci.yml/badge.svg)](https://github.com/rigon-stack/ai-output-checker/actions/workflows/ci.yml)
+
 A small HTTP service that checks AI-generated text against your own rules before you use it.
 You send the text and a list of rules; a model (via OpenRouter) says whether the text passes or should be flagged, and why. Every check is saved to Postgres.
 
